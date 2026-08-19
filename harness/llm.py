@@ -1,0 +1,146 @@
+"""Thin wrapper around the Google GenAI (Gemini) SDK.
+
+Import is lazy: tests that don't touch the LLM keep working without the SDK.
+The planner asks for strict JSON via `response_mime_type="application/json"
+(Google's structured-output mode; no Anthropic-style tool_use blocks here).
+
+Model selection: tries `GEMINI_MODEL` first, then `GEMINI_FALLBACK_MODELS` in
+order, because aliases like `gemini-flash-latest` are frequently saturated
+(503 high demand). `resolved_model` records which model actually answered.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+from . import config
+
+resolved_model: str | None = None
+
+_CLIENT: Any | None = None
+
+
+def _client() -> Any:
+    """Return a module-level client so the SDK keeps one live connection."""
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+    from google import genai
+
+    _CLIENT = genai.Client(
+        api_key=config.GEMINI_API_KEY,
+        http_options=genai.types.HttpOptions(timeout=120_000),
+    )
+    return _CLIENT
+
+
+def _status_code(error: BaseException) -> int | None:
+    for attr in ("status_code", "code"):
+        value = getattr(error, attr, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _is_retryable(error: BaseException) -> bool:
+    status = _status_code(error)
+    if status is not None:
+        return status in (429, 500, 502, 503, 504)
+    name = type(error).__name__
+    return any(tag in name for tag in ("ServerError", "RateLimit", "InternalServer"))
+
+
+def _is_fatal(error: BaseException) -> bool:
+    """Errors that will repeat on any model (auth/quota) vs model-specific 404s."""
+    status = _status_code(error)
+    if status is not None:
+        return status in (400, 401, 403)
+    return type(error).__name__ in ("PermissionDeniedError", "PermissionError", "InvalidArgument")
+
+
+def _candidate_models() -> list[str]:
+    models = [config.GEMINI_MODEL]
+    for model in config.GEMINI_FALLBACK_MODELS:
+        if model not in models:
+            models.append(model)
+    return models
+
+
+def generate_structured_json(
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Call the model and return the raw JSON text of the answer.
+
+    Per model, retries transient failures (503/429) up to
+    LLM_ATTEMPTS_PER_MODEL times with a short backoff, then moves to the next
+    candidate model. Raises only when every candidate is exhausted.
+    """
+    global resolved_model
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Export it or create a .env file "
+            "(see .env.example)."
+        )
+    from google import genai
+
+    models = _candidate_models()
+    last_error: BaseException | None = None
+    for model in models:
+        ok, error = _call_model(model, system_prompt, user_prompt)
+        if ok is not None:
+            resolved_model = model
+            return ok
+        last_error = error
+        if error is not None and _is_fatal(error):
+            break
+    raise RuntimeError(
+        f"Gemini unavailable after {len(models)} model(s) x "
+        f"{config.LLM_ATTEMPTS_PER_MODEL} attempts"
+    ) from last_error
+
+
+def _call_model(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str | None, BaseException | None]:
+    """Try `model` up to LLM_ATTEMPTS_PER_MODEL times. Returns (text, None) on
+    success, (None, last_error) after exhausting - or immediately for a
+    non-retryable error."""
+    from google import genai
+
+    for attempt in range(1, config.LLM_ATTEMPTS_PER_MODEL + 1):
+        try:
+            response = _client().models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_mime_type="application/json",
+                    temperature=config.MAX_TEMPERATURE,
+                    max_output_tokens=config.MAX_OUTPUT_TOKENS,
+                ),
+            )
+            text: str = response.text
+            if not text.strip():
+                raise RuntimeError("Gemini returned an empty response.")
+            return text.strip(), None
+        except Exception as exc:  # noqa: BLE001 - surface after retries
+            if not _is_retryable(exc):
+                print(
+                    f"[llm] model '{model}' error ({type(exc).__name__}), "
+                    "trying next candidate"
+                )
+                return None, exc
+            if attempt < config.LLM_ATTEMPTS_PER_MODEL:
+                print(
+                    f"[llm] model '{model}' busy ({type(exc).__name__}), "
+                    f"retry {attempt}/{config.LLM_ATTEMPTS_PER_MODEL}"
+                )
+                time.sleep(config.LLM_RETRY_SLEEP_SECONDS)
+            else:
+                print(f"[llm] model '{model}' busy, giving up")
+            last_error = exc
+    return None, last_error
