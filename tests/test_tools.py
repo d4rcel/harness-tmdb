@@ -1,9 +1,11 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import pandas as pd
 
 from harness import tools
+from harness import config
 
 
 class LoadDataTest(unittest.TestCase):
@@ -211,6 +213,154 @@ class PlannerEnforcementTest(unittest.TestCase):
         ]}
         out = _ensure_chart("Quelle est la note moyenne des films ?", plan)
         self.assertEqual(len(out["steps"]), 2)
+
+
+class DeepVerificationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tools._df_cache = None
+        cls.df = pd.DataFrame({
+            "movie_id": [1, 2, 3, 4, 5],
+            "title": ["a", "b", "c", "d", "e"],
+            "budget": [100, 0, 200, 300, 400],
+            "revenue": [150, 0, 400, 900, 1200],
+            "year": [2000, 2001, 2002, 2000, 2002],
+            "genres": [["Action"], ["Drama"], ["Action"], ["Drama"], ["Action"]],
+        })
+        tools._df_cache = cls.df
+
+    def test_plausibility_roi_max_rejects_absurd(self):
+        from harness.verify import check_plausibility
+        # ROI of 500000% should be rejected with default max
+        out = {"count": 1, "rows": [{"genre": "Horror", "roi": 500000.0}]}
+        result = check_plausibility({"kind": "plausibility", "roi_max": 5000}, out, {})
+        self.assertFalse(result["passed"])
+        self.assertIn("exceeds max", result["details"])
+
+    def test_plausibility_roi_negative_rejects_below_minus_100(self):
+        from harness.verify import check_plausibility
+        out = {"count": 1, "rows": [{"genre": "Test", "roi": -150.0}]}
+        result = check_plausibility({"kind": "plausibility"}, out, {})
+        self.assertFalse(result["passed"])
+        self.assertIn("below -100%", result["details"])
+
+    def test_plausibility_top_k_exact_count(self):
+        from harness.verify import check_plausibility
+        out = {"count": 3, "rows": [{"genre": "A", "roi": 1}, {"genre": "B", "roi": 2}, {"genre": "C", "roi": 3}]}
+        # top_k=5 but only 3 rows -> fail
+        result = check_plausibility({"kind": "plausibility"}, out, {"top_k": 5})
+        self.assertFalse(result["passed"])
+        self.assertIn("count=3, expected 5", result["details"])
+        # top_k=3 -> pass
+        result = check_plausibility({"kind": "plausibility"}, out, {"top_k": 3})
+        self.assertTrue(result["passed"])
+
+    def test_plausibility_sort_desc(self):
+        from harness.verify import check_plausibility
+        # Correctly sorted descending
+        out = {"count": 3, "rows": [{"roi": 10}, {"roi": 5}, {"roi": 1}], "columns": ["roi"]}
+        result = check_plausibility({"kind": "plausibility"}, out, {"sort_by": "roi"})
+        self.assertTrue(result["passed"])
+        # Not sorted
+        out = {"count": 3, "rows": [{"roi": 1}, {"roi": 10}, {"roi": 5}], "columns": ["roi"]}
+        result = check_plausibility({"kind": "plausibility"}, out, {"sort_by": "roi"})
+        self.assertFalse(result["passed"])
+        self.assertIn("not descending", result["details"])
+
+    def test_plausibility_no_all_zero(self):
+        from harness.verify import check_plausibility
+        out = {"count": 2, "rows": [{"genre": "A", "roi": 0}, {"genre": "B", "roi": 0}], "columns": ["genre", "roi"]}
+        result = check_plausibility({"kind": "plausibility"}, out, {"groupby": ["genre"]})
+        self.assertFalse(result["passed"])
+        self.assertIn("all aggregation values are zero", result["details"])
+
+    def test_recalculation_matches(self):
+        from harness.verify import check_recalculation
+        # Simple case: filter budget>0, groupby year, sum revenue
+        # Our test data: year 2000 has movies 1,4 -> revenue 150+900=1050; year 2002 has movies 3,5 -> 400+1200=1600
+        out = {"count": 2, "columns": ["year", "revenue"], "rows": [
+            {"year": 2000, "revenue": 1050.0},
+            {"year": 2002, "revenue": 1600.0},
+        ]}
+        step_args = {
+            "filters": ["budget > 0"],
+            "groupby": ["year"],
+            "agg": {"revenue": "sum"},
+        }
+        result = check_recalculation({"kind": "recalculation", "sample": 2}, out, step_args, self.df)
+        self.assertTrue(result["passed"], result["details"])
+
+    def test_recalculation_detects_mismatch(self):
+        from harness.verify import check_recalculation
+        # Tampered output - wrong revenue value
+        out = {"count": 2, "columns": ["year", "revenue"], "rows": [
+            {"year": 2000, "revenue": 999999.0},  # wrong
+            {"year": 2002, "revenue": 1600.0},
+        ]}
+        step_args = {
+            "filters": ["budget > 0"],
+            "groupby": ["year"],
+            "agg": {"revenue": "sum"},
+        }
+        result = check_recalculation({"kind": "recalculation", "sample": 2, "tolerance": 0.01}, out, step_args, self.df)
+        self.assertFalse(result["passed"])
+        self.assertIn("mismatch", result["details"])
+
+
+class SynthesizeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tools._df_cache = None
+        cls.df = pd.DataFrame({
+            "movie_id": [1, 2, 3],
+            "title": ["a", "b", "c"],
+            "budget": [100, 200, 300],
+            "revenue": [150, 400, 900],
+            "year": [2000, 2001, 2002],
+            "genres": [["Action"], ["Drama"], ["Action"]],
+        })
+        tools._df_cache = cls.df
+
+    def test_synthesize_tool_exists(self):
+        self.assertIn("synthesize", tools.TOOLS)
+
+    def test_synthesize_returns_answer(self):
+        ctx = {"df": self.df, "step_results": [
+            {"step_id": 1, "tool": "load_data", "intent": "load data", "result": {"rows": 3}},
+            {"step_id": 2, "tool": "compute", "intent": "top genres", "result": {"rows": [{"genre": "Action", "roi": 150}]}},
+        ]}
+        out = tools.synthesize({"question": "Quel genre est le plus rentable ?", "step_results": []}, ctx)
+        self.assertIn("answer", out)
+        self.assertIsInstance(out["answer"], str)
+        self.assertGreater(len(out["answer"]), 0)
+
+
+class PlannerSynthesisTest(unittest.TestCase):
+    def test_synthesis_step_added_for_compute_question(self):
+        from harness.planner import _ensure_synthesis
+        plan = {"steps": [
+            {"step_id": 1, "tool": "load_data", "args": {}},
+            {"step_id": 2, "tool": "compute", "args": {"groupby": ["genre"], "agg": {"roi": "mean"}}},
+        ]}
+        out = _ensure_synthesis("Quels sont les genres les plus rentables ?", plan)
+        self.assertEqual(out["steps"][-1]["tool"], "synthesize")
+        self.assertEqual(out["steps"][-1]["args"]["question"], "Quels sont les genres les plus rentables ?")
+
+    def test_no_synthesis_for_load_data_only(self):
+        from harness.planner import _ensure_synthesis
+        plan = {"steps": [{"step_id": 1, "tool": "load_data", "args": {}}]}
+        out = _ensure_synthesis("charge les données", plan)
+        self.assertEqual(len(out["steps"]), 1)
+
+    def test_no_duplicate_synthesis(self):
+        from harness.planner import _ensure_synthesis
+        plan = {"steps": [
+            {"step_id": 1, "tool": "load_data", "args": {}},
+            {"step_id": 2, "tool": "compute", "args": {}},
+            {"step_id": 3, "tool": "synthesize", "args": {}},
+        ]}
+        out = _ensure_synthesis("question", plan)
+        self.assertEqual(len(out["steps"]), 3)
 
 
 if __name__ == "__main__":

@@ -264,9 +264,55 @@ def write_file(args: dict, df: pd.DataFrame) -> dict:
     return {"path": str(path), "bytes": len(content)}
 
 
+def synthesize(args: dict, ctx: dict) -> dict:
+    """Generate a natural language answer from the verified step results.
+
+    Uses the LLM to produce a French response that directly answers the user's
+    question, based on all step results in the context.
+    """
+    from . import llm
+
+    question = args.get("question", "")
+    step_results = args.get("step_results", [])
+
+    # Build a summary of all step results for the LLM
+    summary_parts = []
+    for sr in step_results:
+        tool = sr.get("tool", "")
+        if tool == "compute":
+            rows = sr.get("result", {}).get("rows", [])
+            if rows:
+                summary_parts.append(f"Calcul ({sr.get('intent', 'résultat')}) : {rows[:5]}")
+        elif tool == "chart":
+            summary_parts.append(f"Graphique généré : {sr.get('result', {}).get('path', '?')}")
+        elif tool == "load_data":
+            summary_parts.append(f"Données chargées : {sr.get('result', {}).get('rows', '?')} films")
+
+    results_summary = "\n".join(summary_parts) if summary_parts else "Aucun résultat."
+
+    system_prompt = (
+        "Tu es un assistant qui résume des résultats d'analyse de films TMDB. "
+        "La question de l'utilisateur était : {question}. "
+        "Voici les résultats vérifiés :\n{results}\n\n"
+        "Réponds en français, 2-3 phrases maximum, directement à la question. "
+        "Inclus les chiffres clés (noms, nombres, pourcentages). "
+        "Sois concis et naturel. Ne mentionne pas les étapes techniques."
+    ).format(question=question, results=results_summary)
+
+    user_prompt = "Produis la réponse finale en français."
+
+    try:
+        answer = llm.generate_text(system_prompt, user_prompt)
+    except Exception as exc:
+        answer = f"Erreur lors de la génération de la réponse : {exc}"
+
+    return {"answer": answer, "question": question}
+
+
 TOOLS = {
     "load_data": lambda args, ctx: load_data(),
     "compute": lambda args, ctx: compute(args, ctx["df"]),
     "chart": lambda args, ctx: chart(ctx["last_result"], args, ctx["df"]),
     "write_file": lambda args, ctx: write_file(args, ctx["df"]),
+    "synthesize": lambda args, ctx: synthesize(args, ctx),
 }

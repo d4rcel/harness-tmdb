@@ -18,8 +18,8 @@ from . import llm
 from .planner_prompt import SYSTEM_PROMPT
 from .tools import PLURAL_TO_SINGULAR
 
-VALID_TOOLS = {"load_data", "compute", "chart", "write_file"}
-VALIDATE_KINDS = {"nonempty", "bound", "type"}
+VALID_TOOLS = {"load_data", "compute", "chart", "write_file", "synthesize"}
+VALIDATE_KINDS = {"nonempty", "bound", "type", "plausibility", "recalculation"}
 VIZ_KEYWORDS = ("graphique", "chart", "plot", "graph", "visual", "diagramme", "graphe")
 RANKING_KEYWORDS = (
     "top", "classement", "ranking", "comparaison", "comparer", "comparison",
@@ -35,7 +35,8 @@ def build_plan(question: str) -> dict:
     )
     plan = _parse_and_validate(raw)
     if plan is not None:
-        return _ensure_chart(question, plan)
+        plan = _ensure_chart(question, plan)
+        return _ensure_synthesis(question, plan)
 
     raw = llm.generate_structured_json(
         system_prompt=SYSTEM_PROMPT + (
@@ -45,7 +46,8 @@ def build_plan(question: str) -> dict:
     )
     plan = _parse_and_validate(raw)
     if plan is not None:
-        return _ensure_chart(question, plan)
+        plan = _ensure_chart(question, plan)
+        return _ensure_synthesis(question, plan)
     raise RuntimeError(f"Planner: plan rejected twice. Last error: {_last_error}")
 
 
@@ -120,6 +122,45 @@ def _ensure_chart(question: str, plan: dict) -> dict:
         kw in lowered for kw in VIZ_KEYWORDS
     ) else "ranking/comparison question"
     print(f"[planner] {reason}: chart step added deterministically")
+    return plan
+
+
+def _ensure_synthesis(question: str, plan: dict) -> dict:
+    """Append a synthesize step at the end to generate a natural language answer.
+
+    Always adds a synthesis step unless the plan only does load_data/write_file.
+    The synthesize step receives all previous step results via args.
+    """
+    steps = plan["steps"]
+    # Don't add synthesis if only load_data or write_file (no compute results to summarize)
+    has_compute = any(step.get("tool") == "compute" for step in steps)
+    if not has_compute:
+        return plan
+    # Don't duplicate if already present
+    if any(step.get("tool") == "synthesize" for step in steps):
+        return plan
+
+    # Collect step results summary for the synthesize tool
+    step_summaries = []
+    for step in steps:
+        step_summaries.append({
+            "step_id": step["step_id"],
+            "tool": step["tool"],
+            "intent": step.get("intent", ""),
+        })
+
+    synthesize_step = {
+        "step_id": len(steps) + 1,
+        "intent": "generate natural language answer",
+        "tool": "synthesize",
+        "args": {
+            "question": question,
+            "step_results": step_summaries,
+        },
+        "validate": {"kind": "type", "field": "answer", "type": "string"},
+    }
+    steps.append(synthesize_step)
+    print("[planner] synthesis step added deterministically")
     return plan
 
 

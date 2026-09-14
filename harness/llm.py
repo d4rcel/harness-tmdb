@@ -101,6 +101,39 @@ def generate_structured_json(
     ) from last_error
 
 
+def generate_text(
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Call the model for free-form text generation (not JSON).
+
+    Uses a slightly higher temperature for natural language.
+    Retries and fallback chain same as generate_structured_json.
+    """
+    global resolved_model
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Export it or create a .env file "
+            "(see .env.example)."
+        )
+    from google import genai
+
+    models = _candidate_models()
+    last_error: BaseException | None = None
+    for model in models:
+        ok, error = _call_model_text(model, system_prompt, user_prompt)
+        if ok is not None:
+            resolved_model = model
+            return ok
+        last_error = error
+        if error is not None and _is_fatal(error):
+            break
+    raise RuntimeError(
+        f"Gemini unavailable after {len(models)} model(s) x "
+        f"{config.LLM_ATTEMPTS_PER_MODEL} attempts"
+    ) from last_error
+
+
 def _call_model(
     model: str,
     system_prompt: str,
@@ -120,6 +153,48 @@ def _call_model(
                     system_instruction=system_prompt,
                     response_mime_type="application/json",
                     temperature=config.MAX_TEMPERATURE,
+                    max_output_tokens=config.MAX_OUTPUT_TOKENS,
+                ),
+            )
+            text: str = response.text
+            if not text.strip():
+                raise RuntimeError("Gemini returned an empty response.")
+            return text.strip(), None
+        except Exception as exc:  # noqa: BLE001 - surface after retries
+            if not _is_retryable(exc):
+                print(
+                    f"[llm] model '{model}' error ({type(exc).__name__}), "
+                    "trying next candidate"
+                )
+                return None, exc
+            if attempt < config.LLM_ATTEMPTS_PER_MODEL:
+                print(
+                    f"[llm] model '{model}' busy ({type(exc).__name__}), "
+                    f"retry {attempt}/{config.LLM_ATTEMPTS_PER_MODEL}"
+                )
+                time.sleep(config.LLM_RETRY_SLEEP_SECONDS)
+            else:
+                print(f"[llm] model '{model}' busy, giving up")
+            last_error = exc
+    return None, last_error
+
+
+def _call_model_text(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str | None, BaseException | None]:
+    """Same as _call_model but for free-form text (no JSON mime type)."""
+    from google import genai
+
+    for attempt in range(1, config.LLM_ATTEMPTS_PER_MODEL + 1):
+        try:
+            response = _client().models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.3,
                     max_output_tokens=config.MAX_OUTPUT_TOKENS,
                 ),
             )

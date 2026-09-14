@@ -35,10 +35,20 @@ def main(argv: list[str] | None = None) -> int:
     print("\n--- per-step outcome ---")
     for step in record["steps"]:
         v = step.get("verification") or "no-clause"
-        print(f"  step {step['step_id']}: {step['tool']} -> {step['status']} ({v})")
+        dv = step.get("deep_verification")
+        if isinstance(dv, dict):
+            dv_str = f", deep={dv.get('criterion', '?')}({dv.get('passed')})"
+        else:
+            dv_str = ""
+        print(f"  step {step['step_id']}: {step['tool']} -> {step['status']} ({v}{dv_str})")
     if record["final"]:
         print("\n--- final ---")
-        print(json.dumps(record["final"], indent=2, ensure_ascii=False))
+        final = dict(record["final"])
+        answer = final.pop("answer", None)
+        print(json.dumps(final, indent=2, ensure_ascii=False))
+        if answer:
+            print("\n--- réponse ---")
+            print(answer)
     return 0
 
 

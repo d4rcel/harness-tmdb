@@ -22,6 +22,8 @@ DATASET (two CSVs joined 1:1 on movies.id = credits.movie_id, {PAIR_COUNT} films
 CRITICAL DATA RULES:
 - Economy: budget=0 on {MISSING_BUDGET} films and revenue=0 on {MISSING_REVENUE} films.
   Any profitability step MUST filter budget>0 AND revenue>0. ROI = (revenue-budget)/budget.
+  IMPORTANT: some films have tiny budgets (~$10) that produce absurd ROI. For ROI questions,
+  ALWAYS add `budget > 1000` filter to exclude micro-budget outliers.
 - Dates: all films are between {DATE_MIN} and {DATE_MAX}. "20 last years" => >= 1997.
 - Genres are MULTI-LABEL (one film belongs to several genres). A per-genre average
   (money, votes) weights films several times: compute it by exploding genre rows and,
@@ -59,7 +61,9 @@ PLAN FORMAT (strict JSON):
   "title". In sort_by and in a chart step's y, reference that exact column name
   (e.g. "title"), never an alias like "title_count".
 - validate accepts: {{"kind": "nonempty"}} or {{"kind": "bound", "min": N}} or
-  {{"kind": "type", "type": "number"}}. Keep it simple.
+  {{"kind": "type", "type": "number"}} or {{"kind": "plausibility"}} or
+  {{"kind": "recalculation", "sample": 3}}. Use plausibility for ROI/profit steps,
+  recalculation for any compute step. Keep it simple.
 - Keep steps minimal (1 compute for simple questions, <=4 total).
 - IMPORTANT: include a final chart step after the compute step (kind bar, x and y
   set from the compute groupby/agg) whenever the question asks for a

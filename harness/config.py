@@ -53,6 +53,11 @@ MAX_OUTPUT_TOKENS = 8192
 LLM_ATTEMPTS_PER_MODEL = 3
 LLM_RETRY_SLEEP_SECONDS = 5.0
 
+# Deep verification policy.
+ROI_MAX_PLAUSIBLE = 10000.0  # 1,000,000% - allows high ROI but catches micro-budget outliers
+RECALCULATION_SAMPLE = 3
+RECALCULATION_TOLERANCE = 0.01  # 1% relative tolerance
+
 # Data window of the dataset (verified from release_date).
 DATE_MIN = "1916-09-04"
 DATE_MAX = "2017-02-03"
