@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import config, executor, llm, memory, planner
+from . import config, llm, memory, react_loop
 from .config import ensure_dirs
 
 
@@ -21,26 +21,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     ensure_dirs()
-    record = memory.new_run_record(question, config.GEMINI_MODEL)
-    print(f"[planner] primary model={config.GEMINI_MODEL}")
+    print(f"[react] primary model={config.GEMINI_MODEL}")
 
-    plan = planner.build_plan(question)
-    record["model"] = llm.resolved_model or config.GEMINI_MODEL
-    print(f"[planner] answered by model={record['model']}")
-    print(f"[planner] plan: {len(plan['steps'])} step(s)")
-
-    log_path = executor.execute(plan, record)
+    log_path = react_loop.run_react_loop(question)
     print(f"\n[harness] run logged to {log_path}")
+
+    # Reload the record to show results
+    import json as json_mod
+    with open(log_path, encoding="utf-8") as f:
+        record = json_mod.load(f)
+
     print(f"[harness] status: {record['status']}")
-    print("\n--- per-step outcome ---")
-    for step in record["steps"]:
-        v = step.get("verification") or "no-clause"
-        dv = step.get("deep_verification")
-        if isinstance(dv, dict):
-            dv_str = f", deep={dv.get('criterion', '?')}({dv.get('passed')})"
-        else:
-            dv_str = ""
-        print(f"  step {step['step_id']}: {step['tool']} -> {step['status']} ({v}{dv_str})")
+    print("\n--- per-turn outcome ---")
+    for turn in record["turns"]:
+        v_syn = turn["verification"]["syntactic"]
+        v_deep = turn["verification"]["deep"]
+        print(f"  turn {turn['turn']}: {turn['action']['tool']} -> {turn['status']} (syn={v_syn['criterion']}={v_syn['passed']}, deep={v_deep.get('criterion', '?')}={v_deep.get('passed', '?')})")
     if record["final"]:
         print("\n--- final ---")
         final = dict(record["final"])

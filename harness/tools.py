@@ -157,6 +157,9 @@ def compute(args: dict, df: pd.DataFrame) -> dict:
 
     groupby = args.get("groupby") or []
     agg = args.get("agg") or {}
+    if isinstance(agg, str):
+        import json as json_mod
+        agg = json_mod.loads(agg)
     if groupby:
         frame, groupby = _normalize_groupby(frame, groupby)
     if groupby:
@@ -273,20 +276,36 @@ def synthesize(args: dict, ctx: dict) -> dict:
     from . import llm
 
     question = args.get("question", "")
+    final_answer = args.get("final_answer", "")
     step_results = args.get("step_results", [])
 
     # Build a summary of all step results for the LLM
     summary_parts = []
     for sr in step_results:
-        tool = sr.get("tool", "")
-        if tool == "compute":
-            rows = sr.get("result", {}).get("rows", [])
-            if rows:
-                summary_parts.append(f"Calcul ({sr.get('intent', 'résultat')}) : {rows[:5]}")
-        elif tool == "chart":
-            summary_parts.append(f"Graphique généré : {sr.get('result', {}).get('path', '?')}")
-        elif tool == "load_data":
-            summary_parts.append(f"Données chargées : {sr.get('result', {}).get('rows', '?')} films")
+        # Handle both old format (step_results with tool/result) and new format (turn_history with action/observation)
+        if "action" in sr:
+            # New format: turn history
+            tool = sr["action"].get("tool", "")
+            obs = sr.get("observation", {})
+            if tool == "compute":
+                rows = obs.get("rows", [])
+                if rows:
+                    summary_parts.append(f"Calcul : {rows[:5]}")
+            elif tool == "chart":
+                summary_parts.append(f"Graphique généré : {obs.get('path', '?')}")
+            elif tool == "load_data":
+                summary_parts.append(f"Données chargées : {obs.get('rows', '?')} films")
+        else:
+            # Old format: step_results
+            tool = sr.get("tool", "")
+            if tool == "compute":
+                rows = sr.get("result", {}).get("rows", [])
+                if rows:
+                    summary_parts.append(f"Calcul ({sr.get('intent', 'résultat')}) : {rows[:5]}")
+            elif tool == "chart":
+                summary_parts.append(f"Graphique généré : {sr.get('result', {}).get('path', '?')}")
+            elif tool == "load_data":
+                summary_parts.append(f"Données chargées : {sr.get('result', {}).get('rows', '?')} films")
 
     results_summary = "\n".join(summary_parts) if summary_parts else "Aucun résultat."
 

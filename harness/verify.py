@@ -52,6 +52,12 @@ def check_output(validate: dict | None, output: dict) -> dict:
             "passed": passed,
             "details": f"sample={sample!r}",
         }
+    if kind == "plausibility":
+        # Delegate to deep check (will be run separately)
+        return {"criterion": "plausibility", "passed": True, "details": "checked in deep verification"}
+    if kind == "recalculation":
+        # Delegate to deep check (will be run separately)
+        return {"criterion": "recalculation", "passed": True, "details": "checked in deep verification"}
     return {"criterion": f"unknown-kind:{kind}", "passed": True, "details": "ignored"}
 
 

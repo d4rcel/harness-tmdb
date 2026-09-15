@@ -58,9 +58,15 @@ ROI_MAX_PLAUSIBLE = 10000.0  # 1,000,000% - allows high ROI but catches micro-bu
 RECALCULATION_SAMPLE = 3
 RECALCULATION_TOLERANCE = 0.01  # 1% relative tolerance
 
-# Data window of the dataset (verified from release_date).
+# ReAct policy.
+MAX_REACT_TURNS = 5
+
+# Dataset metadata (verified from the raw files).
+PAIR_COUNT = 4803
 DATE_MIN = "1916-09-04"
 DATE_MAX = "2017-02-03"
+MISSING_BUDGET = 1037
+MISSING_REVENUE = 1427
 
 
 def ensure_dirs() -> None:

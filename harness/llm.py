@@ -7,6 +7,8 @@ The planner asks for strict JSON via `response_mime_type="application/json"
 Model selection: tries `GEMINI_MODEL` first, then `GEMINI_FALLBACK_MODELS` in
 order, because aliases like `gemini-flash-latest` are frequently saturated
 (503 high demand). `resolved_model` records which model actually answered.
+
+ReAct loop uses native Function Calling for reliable tool invocation.
 """
 
 from __future__ import annotations
@@ -67,6 +69,122 @@ def _candidate_models() -> list[str]:
     return models
 
 
+def _react_tools() -> list[Any]:
+    """Return the function declarations for ReAct native function calling."""
+    from google import genai
+
+    return [
+        genai.types.Tool(function_declarations=[
+            genai.types.FunctionDeclaration(
+                name="load_data",
+                description="Load and enrich the joined TMDB dataset. Must be the first action.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="compute",
+                description="Run deterministic pandas pipeline: filter -> year_range -> groupby/agg -> sort -> top_k.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "filters": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(type=genai.types.Type.STRING),
+                            description="Filter expressions like 'budget > 1000', 'year >= 1997'",
+                        ),
+                        "groupby": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(type=genai.types.Type.STRING),
+                            description="Columns to group by (genres, directors, cast_names, etc.)",
+                        ),
+                        "agg": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="JSON string of aggregations like '{\"roi\": \"mean\", \"title\": \"count\"}'. Keys are column names, values are aggregation functions (mean, sum, count, median, max, min).",
+                        ),
+                        "sort_by": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Column to sort by (descending)",
+                        ),
+                        "top_k": genai.types.Schema(
+                            type=genai.types.Type.INTEGER,
+                            description="Limit to top K rows",
+                        ),
+                        "year_range": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(type=genai.types.Type.INTEGER),
+                            min_items=2,
+                            max_items=2,
+                            description="Year range [min, max], use null for open-ended",
+                        ),
+                    },
+                    required=[],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="chart",
+                description="Render a chart from the last compute result.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "kind": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            enum=["bar", "line"],
+                            description="Chart type",
+                        ),
+                        "x": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="X-axis column",
+                        ),
+                        "y": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Y-axis column",
+                        ),
+                        "path": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Output filename (under output/charts/)",
+                        ),
+                        "title": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Chart title",
+                        ),
+                    },
+                    required=["x", "y"],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="write_file",
+                description="Write a text file under output/results/.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "content": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="File content",
+                        ),
+                        "path": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Output filename",
+                        ),
+                    },
+                    required=["content", "path"],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="finish",
+                description="Signal that you have enough information to answer the question.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+            ),
+        ])
+    ]
+
+
 def generate_structured_json(
     system_prompt: str,
     user_prompt: str,
@@ -122,6 +240,40 @@ def generate_text(
     last_error: BaseException | None = None
     for model in models:
         ok, error = _call_model_text(model, system_prompt, user_prompt)
+        if ok is not None:
+            resolved_model = model
+            return ok
+        last_error = error
+        if error is not None and _is_fatal(error):
+            break
+    raise RuntimeError(
+        f"Gemini unavailable after {len(models)} model(s) x "
+        f"{config.LLM_ATTEMPTS_PER_MODEL} attempts"
+    ) from last_error
+
+
+def generate_react_action(
+    system_prompt: str,
+    user_prompt: str,
+) -> dict:
+    """Call the model with native Function Calling for ReAct action selection.
+
+    Returns a dict with the function call: {"name": "tool_name", "args": {...}}
+    or {"name": "finish", "args": {}}.
+    """
+    global resolved_model
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Export it or create a .env file "
+            "(see .env.example)."
+        )
+    from google import genai
+
+    models = _candidate_models()
+    tools = _react_tools()
+    last_error: BaseException | None = None
+    for model in models:
+        ok, error = _call_model_react(model, system_prompt, user_prompt, tools)
         if ok is not None:
             resolved_model = model
             return ok
@@ -202,6 +354,59 @@ def _call_model_text(
             if not text.strip():
                 raise RuntimeError("Gemini returned an empty response.")
             return text.strip(), None
+        except Exception as exc:  # noqa: BLE001 - surface after retries
+            if not _is_retryable(exc):
+                print(
+                    f"[llm] model '{model}' error ({type(exc).__name__}), "
+                    "trying next candidate"
+                )
+                return None, exc
+            if attempt < config.LLM_ATTEMPTS_PER_MODEL:
+                print(
+                    f"[llm] model '{model}' busy ({type(exc).__name__}), "
+                    f"retry {attempt}/{config.LLM_ATTEMPTS_PER_MODEL}"
+                )
+                time.sleep(config.LLM_RETRY_SLEEP_SECONDS)
+            else:
+                print(f"[llm] model '{model}' busy, giving up")
+            last_error = exc
+    return None, last_error
+
+
+def _call_model_react(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    tools: list[Any],
+) -> tuple[dict | None, BaseException | None]:
+    """Try `model` with native Function Calling for ReAct action selection."""
+    from google import genai
+
+    for attempt in range(1, config.LLM_ATTEMPTS_PER_MODEL + 1):
+        try:
+            response = _client().models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=tools,
+                    tool_config=genai.types.ToolConfig(
+                        function_calling_config=genai.types.FunctionCallingConfig(mode="ANY")
+                    ),
+                    temperature=config.MAX_TEMPERATURE,
+                    max_output_tokens=config.MAX_OUTPUT_TOKENS,
+                ),
+            )
+            # Extract function call from response
+            candidates = response.candidates
+            if not candidates:
+                raise RuntimeError("No candidates in response")
+            parts = candidates[0].content.parts
+            for part in parts:
+                if hasattr(part, "function_call") and part.function_call:
+                    fc = part.function_call
+                    return {"name": fc.name, "args": dict(fc.args)}, None
+            raise RuntimeError("No function call in response")
         except Exception as exc:  # noqa: BLE001 - surface after retries
             if not _is_retryable(exc):
                 print(

@@ -138,83 +138,6 @@ class VerifyTest(unittest.TestCase):
         self.assertTrue(verify.check_output({"kind": "nonempty"}, out)["passed"])
 
 
-class PlannerEnforcementTest(unittest.TestCase):
-    def test_chart_step_added_for_visual_question(self):
-        from harness.planner import _ensure_chart
-        plan = {
-            "steps": [
-                {"step_id": 1, "tool": "load_data", "args": {},
-                 "validate": {"kind": "nonempty"}},
-                {"step_id": 2, "tool": "compute",
-                 "args": {"groupby": ["genre"], "agg": {"roi": "mean"}, "top_k": 5},
-                 "validate": {"kind": "nonempty"}},
-            ]
-        }
-        out = _ensure_chart("Un graphique s'il vous plaît", plan)
-        self.assertEqual(out["steps"][-1]["tool"], "chart")
-        self.assertEqual(out["steps"][2]["args"]["x"], "genre")
-        self.assertEqual(out["steps"][2]["args"]["y"], "roi")
-
-    def test_no_chart_added_without_visual_keyword(self):
-        from harness.planner import _ensure_chart
-        plan = {"steps": [{"step_id": 1, "tool": "load_data", "args": {}}]}
-        out = _ensure_chart("juste les chiffres", plan)
-        self.assertEqual(len(out["steps"]), 1)
-
-    def test_no_duplicate_chart_when_present(self):
-        from harness.planner import _ensure_chart
-        plan = {"steps": [
-            {"step_id": 1, "tool": "load_data", "args": {}},
-            {"step_id": 2, "tool": "compute", "args": {"agg": {"roi": "mean"}}},
-            {"step_id": 3, "tool": "chart", "args": {"kind": "bar"}},
-        ]}
-        out = _ensure_chart("avec un graphique", plan)
-        self.assertEqual(len(out["steps"]), 3)
-
-    def test_chart_added_for_top_n_question(self):
-        from harness.planner import _ensure_chart
-        plan = {"steps": [
-            {"step_id": 1, "tool": "load_data", "args": {}},
-            {"step_id": 2, "tool": "compute",
-             "args": {"groupby": ["genre"], "agg": {"roi": "mean"}, "top_k": 5}},
-        ]}
-        out = _ensure_chart("Quels sont les 5 genres les plus rentables depuis 2007 ?", plan)
-        self.assertEqual(out["steps"][-1]["tool"], "chart")
-        self.assertEqual(out["steps"][-1]["args"]["x"], "genre")
-        self.assertEqual(out["steps"][-1]["args"]["y"], "roi")
-
-    def test_chart_added_for_superlative_question(self):
-        from harness.planner import _ensure_chart
-        plan = {"steps": [
-            {"step_id": 1, "tool": "load_data", "args": {}},
-            {"step_id": 2, "tool": "compute",
-             "args": {"groupby": ["directors"], "agg": {"title": "count"}, "sort_by": "title"}},
-        ]}
-        out = _ensure_chart("Quel réalisateur a dirigé le plus de films ?", plan)
-        self.assertEqual(out["steps"][-1]["tool"], "chart")
-        self.assertEqual(out["steps"][-1]["args"]["x"], "director")
-
-    def test_chart_added_for_explicit_top(self):
-        from harness.planner import _ensure_chart
-        plan = {"steps": [
-            {"step_id": 1, "tool": "load_data", "args": {}},
-            {"step_id": 2, "tool": "compute",
-             "args": {"groupby": ["cast_names"], "agg": {"movie_id": "count"}, "top_k": 10}},
-        ]}
-        out = _ensure_chart("Top 10 acteurs les plus présents", plan)
-        chart = next(s for s in out["steps"] if s["tool"] == "chart")
-        self.assertEqual(chart["args"]["x"], "actor")
-
-    def test_no_chart_for_plain_booleane_question(self):
-        from harness.planner import _ensure_chart
-        plan = {"steps": [
-            {"step_id": 1, "tool": "load_data", "args": {}},
-            {"step_id": 2, "tool": "compute", "args": {"agg": {"vote_average": "mean"}}},
-        ]}
-        out = _ensure_chart("Quelle est la note moyenne des films ?", plan)
-        self.assertEqual(len(out["steps"]), 2)
-
-
 class DeepVerificationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -335,32 +258,76 @@ class SynthesizeTest(unittest.TestCase):
         self.assertGreater(len(out["answer"]), 0)
 
 
-class PlannerSynthesisTest(unittest.TestCase):
-    def test_synthesis_step_added_for_compute_question(self):
-        from harness.planner import _ensure_synthesis
-        plan = {"steps": [
-            {"step_id": 1, "tool": "load_data", "args": {}},
-            {"step_id": 2, "tool": "compute", "args": {"groupby": ["genre"], "agg": {"roi": "mean"}}},
-        ]}
-        out = _ensure_synthesis("Quels sont les genres les plus rentables ?", plan)
-        self.assertEqual(out["steps"][-1]["tool"], "synthesize")
-        self.assertEqual(out["steps"][-1]["args"]["question"], "Quels sont les genres les plus rentables ?")
+class ReactLoopTest(unittest.TestCase):
+    """Tests for the ReAct loop."""
+    
+    @classmethod
+    def setUpClass(cls):
+        tools._df_cache = None
+        cls.df = pd.DataFrame({
+            "movie_id": [1, 2, 3, 4, 5],
+            "title": ["a", "b", "c", "d", "e"],
+            "budget": [100, 0, 200, 300, 400],
+            "revenue": [150, 0, 400, 900, 1200],
+            "year": [2000, 2001, 2002, 2000, 2002],
+            "genres": [["Action"], ["Drama"], ["Action"], ["Drama"], ["Action"]],
+        })
+        tools._df_cache = cls.df
 
-    def test_no_synthesis_for_load_data_only(self):
-        from harness.planner import _ensure_synthesis
-        plan = {"steps": [{"step_id": 1, "tool": "load_data", "args": {}}]}
-        out = _ensure_synthesis("charge les données", plan)
-        self.assertEqual(len(out["steps"]), 1)
+    def test_build_react_context(self):
+        from harness.react_loop import _build_react_context
+        history = [
+            {
+                "turn": 1,
+                "action": {"tool": "load_data", "args": {}},
+                "observation": {"cached": False, "rows": [{"id": 1}]},  # mock rows as list
+                "verification": {
+                    "syntactic": {"criterion": "nonempty", "passed": True, "details": "rows=4803"},
+                    "deep": {"criterion": "deep", "passed": True, "details": "skipped (not compute)"}
+                },
+                "status": "success"
+            }
+        ]
+        context = _build_react_context("Test question", history, 2, 5)
+        self.assertIn("Test question", context)
+        self.assertIn("Turn: 2 of 5", context)
+        self.assertIn("load_data", context)
 
-    def test_no_duplicate_synthesis(self):
-        from harness.planner import _ensure_synthesis
-        plan = {"steps": [
-            {"step_id": 1, "tool": "load_data", "args": {}},
-            {"step_id": 2, "tool": "compute", "args": {}},
-            {"step_id": 3, "tool": "synthesize", "args": {}},
-        ]}
-        out = _ensure_synthesis("question", plan)
-        self.assertEqual(len(out["steps"]), 3)
+    def test_get_validate_clause(self):
+        from harness.react_loop import _get_validate_clause
+        # load_data
+        self.assertEqual(_get_validate_clause("load_data", {}), {"kind": "nonempty"})
+        # compute with top_k and sort_by
+        clause = _get_validate_clause("compute", {"top_k": 5, "sort_by": "roi"})
+        self.assertEqual(clause["kind"], "plausibility")
+        self.assertEqual(clause["top_k"], 5)
+        self.assertEqual(clause["sort_by"], "roi")
+        # chart
+        self.assertEqual(_get_validate_clause("chart", {}), {"kind": "nonempty"})
+
+    def test_run_deep_verification_react_skips_non_compute(self):
+        from harness.react_loop import _run_deep_verification_react
+        result = _run_deep_verification_react("load_data", {}, {}, {"df": self.df})
+        self.assertTrue(result["passed"])
+        self.assertIn("skipped", result["details"])
+
+    def test_run_deep_verification_react_compute_plausibility(self):
+        from harness.react_loop import _run_deep_verification_react
+        # ROI too high should fail
+        out = {"count": 1, "rows": [{"genre": "Horror", "roi": 500000.0}], "columns": ["genre", "roi"]}
+        result = _run_deep_verification_react("compute", {"groupby": ["genres"], "agg": {"roi": "mean"}}, out, {"df": self.df})
+        self.assertFalse(result["passed"])
+        self.assertIn("plausibility", result["details"])
+
+    def test_extract_final_answer(self):
+        from harness.react_loop import _extract_final_answer
+        history = [
+            {"action": {"tool": "compute", "args": {"groupby": ["genres"]}}, "observation": {"rows": [{"genre": "Action", "roi": 100}]}},
+            {"action": {"tool": "chart", "args": {}}, "observation": {"path": "chart.png"}},
+        ]
+        answer = _extract_final_answer(history)
+        self.assertIn("Action", answer)
+        self.assertIn("chart", answer)
 
 
 if __name__ == "__main__":
