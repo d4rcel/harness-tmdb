@@ -70,7 +70,7 @@ def _candidate_models() -> list[str]:
 
 
 def _react_tools() -> list[Any]:
-    """Return the function declarations for ReAct native function calling."""
+    """Return the function declarations for ReAct native function calling (v3 single-agent)."""
     from google import genai
 
     return [
@@ -185,6 +185,238 @@ def _react_tools() -> list[Any]:
     ]
 
 
+def _supervisor_tools() -> list[Any]:
+    """Return the function declarations for Supervisor's agents-as-tools (v4 multi-agent)."""
+    from google import genai
+
+    return [
+        genai.types.Tool(function_declarations=[
+            genai.types.FunctionDeclaration(
+                name="call_data_agent",
+                description="Delegate data loading and computation to Data Agent. Use for: loading data, filtering, grouping, aggregating, sorting, top-k.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "task": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Specific data task description (e.g., 'top 5 directors by film count since 1997')",
+                        ),
+                        "context_summary": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Compressed context summary for the Data Agent",
+                        ),
+                    },
+                    required=["task", "context_summary"],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="call_viz_agent",
+                description="Delegate chart generation to Viz Agent. Use when question asks for graph/chart/plot/top/classement/comparison. MANDATORY if chart keywords present.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "task": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Chart specification (e.g., 'bar chart of director vs film_count')",
+                        ),
+                        "context_summary": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Compressed context summary including data results",
+                        ),
+                    },
+                    required=["task", "context_summary"],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="call_redaction_agent",
+                description="Delegate natural language synthesis to Redaction Agent. Use for producing the final French answer. ALWAYS call this at the end.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "task": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Synthesis task description",
+                        ),
+                        "context_summary": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Compressed context summary with all findings",
+                        ),
+                    },
+                    required=["task", "context_summary"],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="finish",
+                description="Signal that you have enough information to answer the question.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+            ),
+        ])
+    ]
+
+
+def _data_agent_tools() -> list[Any]:
+    """Return the function declarations for Data Agent (load_data, compute, finish)."""
+    from google import genai
+
+    return [
+        genai.types.Tool(function_declarations=[
+            genai.types.FunctionDeclaration(
+                name="load_data",
+                description="Load and enrich the joined TMDB dataset. Must be the first action.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="compute",
+                description="Run deterministic pandas pipeline: filter -> year_range -> groupby/agg -> sort -> top_k.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "filters": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(type=genai.types.Type.STRING),
+                            description="Filter expressions like 'budget > 1000', 'year >= 1997'",
+                        ),
+                        "groupby": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(type=genai.types.Type.STRING),
+                            description="Columns to group by (genres, directors, cast_names, etc.)",
+                        ),
+                        "agg": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="JSON string of aggregations like '{\"roi\": \"mean\", \"title\": \"count\"}'. Keys are column names, values are aggregation functions (mean, sum, count, median, max, min).",
+                        ),
+                        "sort_by": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Column to sort by (descending)",
+                        ),
+                        "top_k": genai.types.Schema(
+                            type=genai.types.Type.INTEGER,
+                            description="Limit to top K rows",
+                        ),
+                        "year_range": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(type=genai.types.Type.INTEGER),
+                            min_items=2,
+                            max_items=2,
+                            description="Year range [min, max], use null for open-ended",
+                        ),
+                    },
+                    required=[],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="finish",
+                description="Signal that you have completed the data task.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+            ),
+        ])
+    ]
+
+
+def _viz_agent_tools() -> list[Any]:
+    """Return the function declarations for Viz Agent (chart, finish)."""
+    from google import genai
+
+    return [
+        genai.types.Tool(function_declarations=[
+            genai.types.FunctionDeclaration(
+                name="chart",
+                description="Render a chart from the last compute result.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "kind": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            enum=["bar", "line"],
+                            description="Chart type",
+                        ),
+                        "x": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="X-axis column",
+                        ),
+                        "y": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Y-axis column",
+                        ),
+                        "path": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Output filename (under output/charts/)",
+                        ),
+                        "title": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Chart title",
+                        ),
+                    },
+                    required=["x", "y"],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="finish",
+                description="Signal that you have completed the chart task.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+            ),
+        ])
+    ]
+
+
+def _redaction_agent_tools() -> list[Any]:
+    """Return the function declarations for Redaction Agent (synthesize, finish)."""
+    from google import genai
+
+    return [
+        genai.types.Tool(function_declarations=[
+            genai.types.FunctionDeclaration(
+                name="synthesize",
+                description="Generate a natural language French answer from the verified step results.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "question": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Original user question",
+                        ),
+                        "final_answer": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Brief summary of key findings to synthesize",
+                        ),
+                        "step_results": genai.types.Schema(
+                            type=genai.types.Type.ARRAY,
+                            items=genai.types.Schema(type=genai.types.Type.OBJECT),
+                            description="Step results from all agents",
+                        ),
+                    },
+                    required=["question", "final_answer", "step_results"],
+                ),
+            ),
+            genai.types.FunctionDeclaration(
+                name="finish",
+                description="Signal that you have completed the synthesis task.",
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={},
+                    required=[],
+                ),
+            ),
+        ])
+    ]
+
+
 def generate_structured_json(
     system_prompt: str,
     user_prompt: str,
@@ -256,7 +488,7 @@ def generate_react_action(
     system_prompt: str,
     user_prompt: str,
 ) -> dict:
-    """Call the model with native Function Calling for ReAct action selection.
+    """Call the model with native Function Calling for ReAct action selection (v3 single-agent).
 
     Returns a dict with the function call: {"name": "tool_name", "args": {...}}
     or {"name": "finish", "args": {}}.
@@ -284,6 +516,112 @@ def generate_react_action(
         f"Gemini unavailable after {len(models)} model(s) x "
         f"{config.LLM_ATTEMPTS_PER_MODEL} attempts"
     ) from last_error
+
+
+def generate_supervisor_action(
+    system_prompt: str,
+    user_prompt: str,
+) -> dict:
+    """Call the model with native Function Calling for Supervisor action selection (v4 multi-agent).
+
+    Returns a dict with the function call: {"name": "tool_name", "args": {...}}
+    or {"name": "finish", "args": {}}.
+    """
+    global resolved_model
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Export it or create a .env file "
+            "(see .env.example)."
+        )
+    from google import genai
+
+    models = _candidate_models()
+    tools = _supervisor_tools()
+    last_error: BaseException | None = None
+    for model in models:
+        ok, error = _call_model_react(model, system_prompt, user_prompt, tools)
+        if ok is not None:
+            resolved_model = model
+            return ok
+        last_error = error
+        if error is not None and _is_fatal(error):
+            break
+    raise RuntimeError(
+        f"Gemini unavailable after {len(models)} model(s) x "
+        f"{config.LLM_ATTEMPTS_PER_MODEL} attempts"
+    ) from last_error
+
+
+def generate_data_agent_action(
+    system_prompt: str,
+    user_prompt: str,
+) -> dict:
+    """Call the model with native Function Calling for Data Agent action selection."""
+    global resolved_model
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+    from google import genai
+
+    models = _candidate_models()
+    tools = _data_agent_tools()
+    last_error: BaseException | None = None
+    for model in models:
+        ok, error = _call_model_react(model, system_prompt, user_prompt, tools)
+        if ok is not None:
+            resolved_model = model
+            return ok
+        last_error = error
+        if error is not None and _is_fatal(error):
+            break
+    raise RuntimeError("Gemini unavailable for Data Agent") from last_error
+
+
+def generate_viz_agent_action(
+    system_prompt: str,
+    user_prompt: str,
+) -> dict:
+    """Call the model with native Function Calling for Viz Agent action selection."""
+    global resolved_model
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+    from google import genai
+
+    models = _candidate_models()
+    tools = _viz_agent_tools()
+    last_error: BaseException | None = None
+    for model in models:
+        ok, error = _call_model_react(model, system_prompt, user_prompt, tools)
+        if ok is not None:
+            resolved_model = model
+            return ok
+        last_error = error
+        if error is not None and _is_fatal(error):
+            break
+    raise RuntimeError("Gemini unavailable for Viz Agent") from last_error
+
+
+def generate_redaction_agent_action(
+    system_prompt: str,
+    user_prompt: str,
+) -> dict:
+    """Call the model with native Function Calling for Redaction Agent action selection."""
+    global resolved_model
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+    from google import genai
+
+    models = _candidate_models()
+    tools = _redaction_agent_tools()
+    last_error: BaseException | None = None
+    for model in models:
+        ok, error = _call_model_react(model, system_prompt, user_prompt, tools)
+        if ok is not None:
+            resolved_model = model
+            return ok
+        last_error = error
+        if error is not None and _is_fatal(error):
+            break
+    raise RuntimeError("Gemini unavailable for Redaction Agent") from last_error
 
 
 def _call_model(

@@ -331,7 +331,7 @@ def synthesize(args: dict, ctx: dict) -> dict:
 TOOLS = {
     "load_data": lambda args, ctx: load_data(),
     "compute": lambda args, ctx: compute(args, ctx["df"]),
-    "chart": lambda args, ctx: chart(ctx["last_result"], args, ctx["df"]),
+    "chart": lambda args, ctx: chart(args.get("data", ctx.get("last_result")), args, ctx["df"]),
     "write_file": lambda args, ctx: write_file(args, ctx["df"]),
     "synthesize": lambda args, ctx: synthesize(args, ctx),
 }

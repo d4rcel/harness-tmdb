@@ -1,0 +1,645 @@
+This is Part 2 of a two-part deep-dive into the anatomy of an agent harness. Part 1 covered what a harness is, why it matters more than the model itself, and the six foundational components: orchestration loop, tool layer, memory systems, context management, prompt construction, and output parsing. If you haven’t read it yet, start there.
+
+This part covers the five reliability components (Components 7–11), walks through a full agent turn step by step, explores the Ralph Loop pattern for tasks that outgrow a single context window, compares how Anthropic, OpenAI, LangGraph, and CrewAI implement harness patterns, lays out the seven architectural decisions every harness builder faces, and closes with why the model and harness cannot be designed independently.
+
+The first six components describe how an agent operates. These five determine whether it survives.
+Inside the Machine: The Reliability Layer
+Component 7: State Management
+
+State is what survives between agent turns. In simple agents, this is just the message history. In production agents running tasks that span hours, state needs checkpointing, persistence, and the ability to resume after crashes.
+
+The most reliable production pattern is append-only event logs: every message, tool call, tool result, and compaction event gets written as a single line of JSON, immediately flushed to disk. The append method opens in append mode and flushes after every write. If the process crashes after that line executes, the event is safe on disk. A replay method reads the file back line by line and reconstructs the full session. Because the file is append-only, two runs can share the same log without overwriting each other. This is the entire durability story for session persistence.
+
+LangGraph adds typed state dictionaries with reducers and checkpoints at super-step boundaries. The checkpoint enables time-travel debugging: if something went wrong at turn 12, you can restore to turn 11 and replay.
+
+import json
+import hashlib
+from pathlib import Path
+from datetime import datetime
+from typing import Any, TypedDict, Optional
+
+class AgentState(TypedDict):
+    task_id: str
+    messages: list[dict]
+    tool_results: list[dict]
+    completed_steps: list[str]
+    current_objective: str
+    turn: int
+class CheckpointedStateManager:
+  
+    def __init__(self, session_id: str, checkpoint_dir: str = ".checkpoints"):
+        self.session_id = session_id
+        self.checkpoint_dir = Path(checkpoint_dir) / session_id
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.state: AgentState = None
+  
+    def initialize(self, task: str) -> AgentState:
+        self.state = AgentState(
+            task_id=self._generate_id(task),
+            messages=[],
+            tool_results=[],
+            completed_steps=[],
+            current_objective=task,
+            turn=0,
+        )
+        self._save_checkpoint("init")
+        return self.state
+  
+    def resume(self) -> Optional[AgentState]:
+        """Resume from the latest checkpoint if one exists."""
+        checkpoints = sorted(self.checkpoint_dir.glob("turn_*.json"))
+        if not checkpoints:
+            return None
+  
+        latest = checkpoints[-1]
+        self.state = json.loads(latest.read_text())
+        print(f"Resumed from checkpoint: {latest.name}")
+        return self.state
+  
+    def update(self, updates: dict) -> AgentState:
+        """Apply updates and save checkpoint."""
+        for key, value in updates.items():
+            if key in self.state:
+                self.state[key] = value
+  
+        self.state["turn"] += 1
+        self._save_checkpoint(f"turn_{self.state['turn']:04d}")
+        return self.state
+  
+    def time_travel(self, turn: int) -> AgentState:
+        """Restore state from a specific turn for debugging."""
+        checkpoint_file = self.checkpoint_dir / f"turn_{turn:04d}.json"
+        if not checkpoint_file.exists():
+            raise ValueError(f"No checkpoint for turn {turn}")
+  
+        self.state = json.loads(checkpoint_file.read_text())
+        return self.state
+  
+    def _save_checkpoint(self, label: str):
+        checkpoint_file = self.checkpoint_dir / f"{label}.json"
+        checkpoint_file.write_text(json.dumps(self.state, indent=2))
+  
+    def _generate_id(self, task: str) -> str:
+        return hashlib.md5(f"{task}{datetime.now()}".encode()).hexdigest()[:8]
+
+Time-travel debugging becomes essential the first time your agent corrupts state at turn 47 of a 60-turn task and you need to pinpoint exactly where it went wrong.
+Component 8: Error Handling
+
+99% per-step reliability across 10 steps gives 90.4% end-to-end success. At 50 steps: 60.5%. You cannot rely on individual step reliability. The harness must handle errors systematically.
+
+Four error categories with distinct strategies:
+
+    Transient (rate limits, timeouts): Retry with exponential backoff and jitter.
+    LLM-recoverable (wrong output format, constraint violation): Return as a tool message so the model can adjust.
+    User-fixable (needs human decision or context): Interrupt and wait.
+    Unexpected (unknown failure mode): Bubble up for debugging. Do not retry blindly.
+
+import time
+import random
+from enum import Enum
+from typing import Callable, Any
+
+class ErrorType(Enum):
+    TRANSIENT = "transient"
+    LLM_RECOVERABLE = "llm_recoverable"
+    USER_FIXABLE = "user_fixable"
+    UNEXPECTED = "unexpected"
+def classify_error(error: Exception) -> ErrorType:
+    """Classify an error to determine the right handling strategy."""
+    error_str = str(error).lower()
+  
+    # Transient: likely to resolve on retry
+    if any(x in error_str for x in ["rate limit", "timeout", "overloaded", "503", "429"]):
+        return ErrorType.TRANSIENT
+  
+    # LLM-recoverable: model can fix if shown the error
+    if any(x in error_str for x in ["invalid format", "missing required", "validation", "parse"]):
+        return ErrorType.LLM_RECOVERABLE
+  
+    # User-fixable: needs human decision
+    if any(x in error_str for x in ["permission denied", "authentication", "authorization"]):
+        return ErrorType.USER_FIXABLE
+  
+    return ErrorType.UNEXPECTED
+def retry_with_backoff(
+    fn: Callable,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+) -> Any:
+    """Exponential backoff with jitter for transient errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            error_type = classify_error(e)
+  
+            if error_type != ErrorType.TRANSIENT or attempt == max_retries:
+                raise
+  
+            # Jitter prevents thundering herd
+            delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+            print(f"Transient error (attempt {attempt + 1}): {e}. Retrying in {delay:.1f}s")
+            time.sleep(delay)
+def safe_tool_call(
+    tool_name: str,
+    tool_args: dict,
+    messages: list[dict],
+) -> tuple[str, bool]:
+    """
+    Execute a tool with full error handling.
+    Returns (result, should_continue).
+    LLM-recoverable errors come back as error messages to the loop.
+    """
+    try:
+        result = retry_with_backoff(
+            lambda: execute_tool(tool_name, tool_args)
+        )
+        return str(result), True
+  
+    except Exception as e:
+        error_type = classify_error(e)
+  
+        if error_type == ErrorType.LLM_RECOVERABLE:
+            # Return error as feedback to the model, not a crash
+            error_msg = (
+                f"Tool '{tool_name}' failed: {str(e)}. "
+                f"Please adjust your approach and try again."
+            )
+            return error_msg, True   # Loop continues with error feedback
+  
+        elif error_type == ErrorType.USER_FIXABLE:
+            # Signal that human intervention is needed
+            return f"NEEDS_HUMAN_INPUT: {str(e)}", False
+  
+        else:
+            # Unexpected: surface it
+            raise
+
+Manus keeps failed actions and stack traces in context rather than compressing them away. Erasing failures causes models to repeat the same broken approach. Keep the error. Let the model learn from it.
+
+Cap retries at 2. If it hasn’t worked in two tries, it’s probably not going to work in twenty.
+Component 9: Guardrails and Safety
+
+Guardrails are not just input filters. They operate at three distinct levels: before the model runs (input guardrails), on what the model produces (output guardrails), and on what tools the model can call (tool guardrails).
+
+The architectural principle from Anthropic: the model decides what to attempt. The tool system decides what’s allowed. These are separate concerns and keeping them separate is what makes guardrails reliable. If the model could override tool permissions, guardrails would be pointless.
+
+Claude Code’s three-stage permission flow:
+
+    Trust established at project load (read CLAUDE.md, set baseline permissions)
+    Permission checked before each tool call
+    Explicit user confirmation required for high-risk operations (file deletion, system changes)
+
+from enum import Enum
+from typing import Callable, Optional
+import re
+
+class RiskLevel(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    BLOCK = "block"
+TOOL_RISK_MAP = {
+    "read_file": RiskLevel.LOW,
+    "write_file": RiskLevel.MEDIUM,
+    "run_command": RiskLevel.HIGH,   # Overridden by classify_bash_command() below
+    "delete_file": RiskLevel.HIGH,
+    "network_request": RiskLevel.MEDIUM,
+}
+BASH_READ_ONLY = {"ls", "cat", "grep", "find", "head", "tail", "echo", "pwd"}
+BASH_FULL_ACCESS = {"rm", "sudo", "shutdown", "mkfs", "dd", "kill"}
+def classify_bash_command(command: str) -> RiskLevel:
+    """
+    Dynamically classify bash commands by risk.
+    The same tool (bash) is safe or dangerous depending on the command string.
+    """
+    first_token = command.strip().split()[0] if command.strip() else ""
+    if first_token in BASH_READ_ONLY:
+        return RiskLevel.LOW
+    if first_token in BASH_FULL_ACCESS:
+        return RiskLevel.BLOCK
+    return RiskLevel.MEDIUM
+INPUT_BLOCKLIST = [
+    r"ignore previous instructions",
+    r"disregard your system prompt",
+    r"you are now",
+]
+def check_input_guardrails(user_message: str) -> tuple[bool, str]:
+    """Check input for prompt injection and policy violations."""
+    lower = user_message.lower()
+    for pattern in INPUT_BLOCKLIST:
+        if re.search(pattern, lower):
+            return False, f"Input blocked: potential prompt injection detected."
+    return True, ""
+def check_tool_permission(
+    tool_name: str,
+    tool_args: dict,
+    user_confirm_fn: Optional[Callable] = None,
+) -> tuple[bool, str]:
+    """
+    Three-stage permission check.
+    Returns (allowed, reason).
+    """
+    risk = TOOL_RISK_MAP.get(tool_name, RiskLevel.MEDIUM)
+  
+    if risk == RiskLevel.BLOCK:
+        return False, f"Tool '{tool_name}' is not permitted."
+  
+    if risk == RiskLevel.HIGH:
+        if user_confirm_fn is None:
+            return False, f"Tool '{tool_name}' requires explicit user confirmation."
+  
+        confirmed = user_confirm_fn(
+            f"Agent wants to run '{tool_name}' with args: {tool_args}. Allow?"
+        )
+        if not confirmed:
+            return False, "User denied high-risk operation."
+  
+    return True, ""
+class GuardrailsMiddleware:
+    """Wraps the orchestration loop with input/output/tool guardrails."""
+  
+    def __init__(self, tripwire_patterns: list[str] = None):
+        self.tripwire_patterns = tripwire_patterns or [
+            r"DROP TABLE",
+            r"rm -rf",
+            r"format c:",
+        ]
+        self.tripped = False
+  
+    def check_output(self, model_output: str) -> tuple[bool, str]:
+        """Check model output for tripwire patterns. Halt immediately if triggered."""
+        for pattern in self.tripwire_patterns:
+            if re.search(pattern, model_output, re.IGNORECASE):
+                self.tripped = True
+                return False, f"Tripwire triggered: unsafe pattern detected in agent output."
+        return True, ""
+  
+    def is_tripped(self) -> bool:
+        return self.tripped
+
+The “tripwire” mechanism is important. When a tripwire fires, the harness halts immediately. It does not give the model another chance to try. Tripwires exist precisely because some outputs are so dangerous that retry logic only makes things worse.
+Component 10: Verification Loops
+
+Verification is what separates toys from production systems.
+
+Boris Cherny, who led Claude Code’s development, documented that giving the model a way to verify its own work improves final quality 2–3x. This isn’t self-reflection through prompting. It’s running actual deterministic checks (tests, type checkers, linters) and feeding results back into the loop.
+
+The key finding: LLMs can spot errors in existing content more reliably than they avoid making those errors during generation. Verification is cheap. Regeneration is expensive. Run the tests first.
+
+Three verification types:
+
+    Rules-based (deterministic): Tests, linters, type checkers. Milliseconds. Run on every change.
+    Visual: Screenshot capture via Playwright, then LLM inspects the image. For UI work.
+    LLM-as-judge: Semantic validation for quality, correctness, or policy compliance. Expensive but catches what deterministic checks miss.
+
+import subprocess
+from dataclasses import dataclass
+from typing import Optional
+import anthropic
+
+@dataclass
+class VerificationResult:
+    passed: bool
+    check_type: str
+    details: str
+    suggested_fix: Optional[str] = None
+def run_deterministic_checks(project_dir: str) -> VerificationResult:
+    """Run tests and linters. Fastest, cheapest, most reliable."""
+    result = subprocess.run(
+        ["python", "-m", "pytest", "--tb=short", "-q"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+  
+    if result.returncode == 0:
+        return VerificationResult(
+            passed=True,
+            check_type="pytest",
+            details=result.stdout,
+        )
+  
+    return VerificationResult(
+        passed=False,
+        check_type="pytest",
+        details=result.stdout + result.stderr,
+    )
+def llm_judge(
+    task_description: str,
+    agent_output: str,
+    rubric: str,
+) -> VerificationResult:
+    """Use a separate LLM call to evaluate output quality."""
+    client = anthropic.Anthropic()
+  
+    response = client.messages.create(
+        model="claude-opus-4-7",
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Evaluate this agent output against the task and rubric.\n\n"
+                f"Task: {task_description}\n\n"
+                f"Output:\n{agent_output}\n\n"
+                f"Rubric:\n{rubric}\n\n"
+                f"Respond with: PASS or FAIL, then a brief explanation, "
+                f"then a specific suggested fix if it failed."
+            )
+        }]
+    )
+  
+    judgment = response.content[0].text
+    passed = judgment.strip().upper().startswith("PASS")
+  
+    return VerificationResult(
+        passed=passed,
+        check_type="llm_judge",
+        details=judgment,
+    )
+def verification_pipeline(
+    project_dir: str,
+    task_description: str,
+    agent_output: str,
+    max_fix_attempts: int = 3,
+) -> bool:
+    """
+    Run checks in cost order (cheapest first), loop on failure.
+    Returns True if verification passes, False if max attempts exceeded.
+    """
+    for attempt in range(max_fix_attempts):
+        # Stage 1: deterministic (fast, free)
+        det_result = run_deterministic_checks(project_dir)
+        if not det_result.passed:
+            print(f"Tests failed (attempt {attempt + 1}): {det_result.details[:200]}")
+            # Feed failure back to the agent to fix (handled by caller)
+            return False
+  
+        # Stage 2: LLM judge (semantic, slower)
+        judge_result = llm_judge(
+            task_description,
+            agent_output,
+            rubric="Code is correct, readable, handles edge cases, and matches task requirements."
+        )
+        if not judge_result.passed:
+            print(f"LLM judge failed (attempt {attempt + 1}): {judge_result.details[:200]}")
+            return False
+  
+        # All checks passed
+        return True
+  
+    return False
+
+LangChain’s PreCompletionChecklistMiddleware from their Terminal Bench work forced a four-stage pipeline: planning/discovery, build, verify, fix. This single addition was a major contributor to their 13.7-point score improvement. The "reasoning sandwich" pattern (maximum reasoning budget at planning and verification, standard at execution) squeezed out an additional gain. Running maximum reasoning throughout caused agent timeouts (53.9% score). The sandwich pattern hit 66.5%.
+Component 11: Subagent Orchestration
+
+Multi-agent systems exist because single agents have two hard limits: the context window and the tool overlap problem. When a task outgrows one context window, or when tool count exceeds around 10 and decision quality degrades, it’s time to split. But every handoff is lossy: whatever Agent A knows gets compressed into a summary. That information loss is the real cost of multi-agent systems.
+
+Three execution models from Claude Code: Fork (subagent in a clean context with a targeted sub-task), Teammate (parallel agent on a separate part of the same problem), and Worktree (isolated git worktree for experiments that shouldn’t touch the main branch).
+
+import asyncio
+from dataclasses import dataclass
+from typing import Optional
+import anthropic
+
+@dataclass
+class SubagentTask:
+    task_id: str
+    description: str
+    context_summary: str   # Compressed context from parent
+    tools: list[str]       # Tool whitelist for this subagent
+@dataclass  
+class SubagentResult:
+    task_id: str
+    success: bool
+    result_summary: str    # Condensed output for parent context
+    artifacts: dict        # Files, data produced
+async def spawn_subagent(task: SubagentTask) -> SubagentResult:
+    """
+    Fork a subagent with isolated context.
+    Key: subagent receives a summary, not the full parent context.
+    Returns a condensed result, not a full transcript.
+    """
+    client = anthropic.Anthropic()
+  
+    # Subagent gets compressed context, not parent's full history
+    subagent_system = (
+        f"You are a specialized agent for the following task.\n\n"
+        f"Context summary from orchestrator:\n{task.context_summary}\n\n"
+        f"Complete your specific task, then summarize your findings "
+        f"in 200 words or less."
+    )
+  
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=subagent_system,
+        messages=[{"role": "user", "content": task.description}]
+    )
+  
+    result_text = response.content[0].text
+  
+    # Condense result before returning to parent
+    condense_response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=256,
+        messages=[{
+            "role": "user",
+            "content": f"Summarize this in 150 words, keeping only key findings:\n\n{result_text}"
+        }]
+    )
+  
+    return SubagentResult(
+        task_id=task.task_id,
+        success=True,
+        result_summary=condense_response.content[0].text,
+        artifacts={},
+    )
+async def parallel_subagents(tasks: list[SubagentTask]) -> list[SubagentResult]:
+    """Run multiple subagents in parallel."""
+    return await asyncio.gather(*[spawn_subagent(t) for t in tasks])
+
+Anthropic’s multi-agent research system achieved 90.2% improvement over single-agent performance by keeping each subagent in an isolated context that returns only a condensed summary. The parent agent’s context stays clean.
+What Actually Happens in One Agent Turn?
+
+All 11 components interact in every single turn. Here’s the full sequence.
+Press enter or click to view image in full size
+Sequence of Components (Credits: ChatGPT)
+
+Step 1: Prompt Assembly. Before a single token is generated, the harness builds the system prompt from the priority stack (Component 5), queries the memory index (Component 3) and lazy-loads only relevant topic files, injects tool schemas scoped to the current task phase (Component 2), and formats conversation history with position-aware injection (Component 4), placing critical content at the start and end to exploit primacy and recency bias. This step is where most context rot begins if the harness is naive about what it includes.
+
+Step 2: LLM Inference. The assembled context goes to the model API. Tokens stream back. The harness counts them against the session’s token budget. This is the only step in the loop where output is probabilistic. Everything else is deterministic engineering designed to handle that uncertainty.
+
+Step 3: Output Classification. The output parser (Component 6) makes a routing decision: tool calls present means loop continues; no tool calls means final answer and terminate; handoff marker means compress context and pass control to the named subagent. Output guardrails (Component 9) fire here, checking for tripwire patterns before any action is taken.
+
+Step 4: Tool Execution. For each tool call: validate arguments against the schema, check permissions (Component 9), execute with a timeout, capture results and errors. Critically, tool errors should return as structured error strings, not exceptions. The model receives the error as a tool result, reasons about what went wrong, and adjusts. Crashing the loop on tool failure is one of the most common harness design mistakes.
+
+Step 5: Result Packaging. Tool results are formatted as tool_result blocks. Observation masking can be applied here: verbose outputs (file contents, search results) get summarized before entering the running context. The full result saves to state (Component 7); only the condensed version enters message history.
+
+Step 6: Verification. Lightweight checks (tests, linters) run after code changes. LLM-as-judge runs at checkpoints. When verification fails, the full error output appends as user content, giving the model concrete, actionable feedback with file names and line numbers, not just “it failed.”
+
+Step 7: Context Update and Loop Decision. Messages append to history, state checkpoints (Component 7), token usage recalculates. If context approaches the compaction threshold (typically 75–80% of budget), the harness summarizes the oldest conversation turns using a cheap model and continues. Then either start the next turn or exit on any termination condition: no tool calls, max turns exceeded, token budget exhausted, tripwire fired, user interrupt, or model safety refusal.
+
+The loop runs identical code on every turn. The intelligence varies. The harness stays consistent. That consistency is what makes an agent predictable enough to deploy.
+How Production Agents Survive Multiple Context Windows
+
+Single-session tasks are manageable. But what happens when a task genuinely takes more context than any one window can hold?
+
+This is the Ralph Loop problem (also called the Geoff Huntley technique, after the developer who first documented it in mid-2025). The insight is straightforward but powerful: use the filesystem as your persistent memory layer.
+
+The core pattern is a two-phase loop:
+
+Phase 1 (Initializer Agent): Sets up the environment. Creates a progress.md file with task objectives, generates an initial prd.json with the feature list, makes an initial git commit. Runs once.
+
+Phase 2 (Coding Agent, runs repeatedly): Each session starts fresh. The agent reads git log to understand what's been done, reads progress.md to see what's left, picks the highest-priority incomplete item, works on it, commits with a descriptive message, updates progress.md, and exits.
+
+# Phase 1: Initializer
+INITIALIZER_PROMPT = """
+You are setting up a long-running development task.
+Task description: {task}
+Create the following:
+1. A progress.md file with all objectives listed as incomplete checkboxes
+2. Make an initial git commit with "feat: initialize project structure"
+3. Exit when setup is complete.
+"""
+# Phase 2: Coding Agent (called in a loop)
+CODING_AGENT_PROMPT = """
+You are a coding agent resuming work on an ongoing task.
+First, read the project state:
+- Run: git log --oneline -20
+- Read: progress.md
+- Read: any relevant source files
+Then:
+1. Find the first unchecked item in progress.md
+2. Implement it completely
+3. Write tests if applicable
+4. Run tests to verify
+5. Git commit with a descriptive message
+6. Update progress.md (check the item off)
+7. Exit
+Do not attempt more than one item per session.
+"""
+def ralph_loop(task: str, max_iterations: int = 20):
+    """
+    Run the initializer once, then loop the coding agent.
+    Each iteration gets a fresh context window.
+    """
+    # Phase 1: Setup (once)
+    run_agent(
+        system_prompt=INITIALIZER_PROMPT.format(task=task),
+        user_message="Set up the project.",
+        tools=get_tool_schemas(),
+        max_turns=10,
+    )
+  
+    # Phase 2: Loop with fresh context each time
+    for iteration in range(max_iterations):
+        print(f"Starting iteration {iteration + 1}")
+  
+        result = run_agent(
+            system_prompt=CODING_AGENT_PROMPT,
+            user_message="Continue working on the task.",
+            tools=get_tool_schemas(),
+            max_turns=30,
+        )
+  
+        # Check if all objectives are complete
+        progress = Path("progress.md").read_text()
+        if "[ ]" not in progress:
+            print("All objectives complete.")
+            break
+  
+    print(f"Completed in {iteration + 1} iterations.")
+
+The filesystem provides continuity that the context window cannot. Git history is the agent’s memory across sessions. The progress.md is its todo list. Each new context window starts fresh with low context rot, reads exactly what it needs, and contributes one piece of work. Instead of fighting the context window's limits, you design around them.
+
+Anthropic shipped an official version as a Claude Code plugin using a stop hook that intercepts session exits and restarts the agent while preserving file modifications and git history. The community debate was instructive: the official plugin keeps all iterations in one growing session, which eventually hits the rot problem it was trying to solve. The bash loop approach (calling Claude Code fresh per iteration) maintains strictly clean contexts. Most practitioners prefer the bash version.
+
+The Ralph Loop works best for tasks with objectively measurable completion criteria: passing tests, successful builds, all checkboxes marked in progress.md. It's less suited for exploratory tasks where you genuinely need accumulating context to reason about the next step. And since the agent's state lives entirely in git history and plain markdown, you can swap the underlying model between iterations. Start with a cheaper model for scaffolding, switch to a more capable one for complex passes. The harness stays constant. The model is a plugin.
+How the Frameworks Implement Harness Patterns
+
+Remember the distinction: LangChain, LangGraph, AutoGen, and CrewAI are frameworks (assembly required). Claude Code, Codex, Cursor, Windsurf are harnesses (ships working). But when you build your own harness, you’ll likely use a framework underneath. Here’s how the major ones approach the core patterns.
+
+Anthropic / Claude SDK. Thin-harness philosophy: a single query() function, async iterator, application owns context and state management. The Gather-Act-Verify loop (read-only tools first, then write, then verify) is the preferred production pattern. The 512,000-line Claude Code TypeScript codebase isn't a contradiction of thin-harness thinking. It's the scaffolding that fills the gap between current model capability and where post-training will eventually land.
+
+OpenAI Agents SDK. Code-first with a Runner class in three modes (async, sync, streamed). Context managed server-side via previous_response_id chaining, which reduces bandwidth but means your agent's memory lives in OpenAI's systems. Handoffs and agents-as-tools are first-class. Codex splits into three clean layers: Core (the loop), App Server (state, memory), Client Surfaces (IDE, CLI, web).
+
+LangGraph. Explicit state graphs: nodes are Python functions, edges route based on state, conditional edges handle branching. AgentExecutor was deprecated in v0.2 because implicit loops made failure hard to debug. Every routing decision is now visible as an edge. Super-step checkpointing saves to SQLite/Postgres, enabling time-travel debugging and crash recovery.
+
+CrewAI. Role-based: Agent (persona + tools), Task (unit of work), Crew (shared objective). Best when your problem maps naturally to distinct specializations. The Flows layer adds a deterministic backbone over autonomous Crews.
+
+FeatureAnthropic SDKOpenAI SDKLangGraphCrewAIState modelMessage historySessions / response chainingTyped dict graphRole-based crewCheckpointingGit + progress filesprevious_response_idSuper-stepNone nativeMulti-agentFork / Teammate / WorktreeHandoffs / agents-as-toolsNested graphsCrews + FlowsHarness thicknessThin (model-first)MediumThick (explicit control)Medium-thick
+Seven Decisions That Define Your Harness
+
+Before writing a line of harness code, you have seven architectural decisions to make. Each is a tradeoff, not a rule.
+Press enter or click to view image in full size
+Architecture Decision for Agent Harness (Credits: ChatGPT)
+1. Single-Agent vs Multi-Agent
+
+Split into multiple agents when tool overlap exceeds around 10 tools (decision quality degrades with large tool sets), or when tasks decompose cleanly into isolated sub-domains with different permission requirements. Don’t split just because it sounds architecturally sophisticated. Every handoff is a lossy compression operation. The parent agent’s context gets summarized; information gets lost; the sub-agent starts with an incomplete picture.
+
+Anthropic’s multi-agent research system achieved 90.2% improvement over single-agent performance, but it worked because the task was genuinely too large for one context window and the sub-tasks were genuinely independent. If your task is 30 turns and fits in one context, multi-agent only adds latency and handoff loss.
+2. ReAct vs Plan-and-Execute
+
+ReAct works for exploratory tasks where step 3 genuinely depends on the output of step 2. Plan-and-execute works for well-defined tasks where the shape of the work is knowable upfront. The LLMCompiler architecture reports 3.6x speedup through parallel task execution, but that assumes a mostly-stable plan. If your task requires constant replanning, you’ve added planning overhead on top of a ReAct loop and made things slower. The hybrid approach (plan once, allow two replans max) often wins.
+3. Context Management Strategy
+
+Match strategy to task type. For exploration-heavy tasks with lots of dead-ends: observation masking. For tasks with stable growing data: compaction at 75–80% budget. For deep knowledge retrieval: JIT loading from topic files. For tasks that outgrow one context window: the Ralph Loop or sub-agent delegation. Complex agents often combine all of these at different layers.
+4. Verification Loop Design
+
+Computational checks (tests, linters, type checkers) are cheap enough to run on every change. LLM-as-judge runs at checkpoints only: task completion, before a commit, before any irreversible action. Cap correction attempts at two or three. The first two rounds of self-correction capture roughly 75% of reachable improvement; rounds beyond that show diminishing returns and mostly burn tokens.
+5. Permission Architecture
+
+Permissive-fast or restrictive-safe? These are not moral choices. They’re engineering choices about who can do damage and how much.
+
+Development environments with trusted users and reversible actions (version controlled files, test databases) can run with minimal confirmation prompts. Agents with access to production systems, customer data, financial transactions, or external communications need explicit confirmation for every high-risk operation. And “high-risk” needs to be defined explicitly in the harness: what triggers a confirmation prompt, what is blocked entirely, and what runs freely.
+
+The three-stage Claude Code model is a good template: trust established at load (read project config, set baseline), permission checked before each tool call (consult the rule set), explicit confirmation for flagged operations (write to user). Stage 3 is the safety valve; it should fire rarely if stage 2 is well-designed.
+6. Tool Scoping
+
+Design for the minimum viable toolset. Vercel removed 80% of their agent’s tools and got 100% success where 80% was the ceiling before. When you genuinely need many tools, use lazy loading: register all tools in the harness but only inject schemas for the tools relevant to the current task phase. The model doesn’t need bash execution tools during planning. It doesn’t need database tools when writing documentation. Context saved here directly improves reasoning quality.
+7. Harness Thickness
+
+Thin harness (Anthropic’s bet): trust the model, keep explicit control logic minimal, let post-training absorb complexity over time. Thick harness (LangGraph’s bet): explicit control over every state transition pays off in debuggability and reliability.
+
+The future-proofing test: if your harness needs to add complexity every time you upgrade to a better model, you’ve designed around current model limitations rather than for model strength. A well-designed harness gets simpler as models improve. That’s what Manus demonstrated across five rewrites. If yours keeps growing with every model upgrade, that’s the signal something is wrong.
+The Model and Harness Cannot Be Designed Independently
+
+This is what most third-party harness builders miss.
+
+Claude Code’s tool system was not built independently and then connected to Claude. It was co-designed and co-trained. Anthropic used post-training with the harness in the loop, meaning Claude developed its behavior patterns in the context of the actual tool system it would use in production. The model’s understanding of “what to do when” is tightly coupled to the harness’s actual tool definitions.
+
+The Codex 5.3 prompting guide documents a concrete example: the apply_patch tool accepts patches in a specific format. That format was designed so Claude, through training, would produce patches in exactly that format reliably. Change the format without retraining, and performance degrades.
+
+The practical implication: if your harness works with a particular model version and you’re getting good results, pin that version. Test every model upgrade against your full task suite. Model upgrades can improve general benchmarks while degrading performance in harness-specific patterns. Manus handled this by staying orthogonal to model internals as much as possible, optimizing context engineering rather than tool format, which is why they could rebuild the harness five times without starting from scratch on model behavior.
+Is the Harness a Temporary Crutch?
+
+The construction scaffolding analogy is seductive. Scaffolding enables the building but isn’t the building. Once construction is done, the scaffolding comes down. Maybe the harness is the same.
+
+Manus’s five rewrites suggest some truth here. Each rebuild removed complexity as models improved. Complex tool definitions became general shell execution. “Management agents” became simple structured handoffs.
+
+But there are engineering problems the harness solves that have nothing to do with model intelligence:
+
+Context management is a physical constraint, not a capability gap. No model intelligence changes the attention dilution math. The harness manages context forever.
+
+State persistence is infrastructure. A model that can’t write to disk between sessions can’t maintain state. The harness provides the persistence layer.
+
+Verification is a systems problem. Deterministic tests run faster and more reliably than any LLM self-evaluation. Running pytest will always be cheaper than asking the model if the code passes.
+
+Safety and permissions. The separation between “what the model wants to do” and “what the system allows” is a deliberate design principle, not a workaround. You want that separation even with a perfect model.
+
+The field is moving toward thinner harnesses. That direction is clear from Manus’s rewrites, from models absorbing tool-use patterns through training, from Anthropic’s model-first philosophy. But thinner is not absent. The harness never goes to zero.
+Harness Engineering Is the Actual Job
+
+Two products. Same model. One in top 5 on Terminal Bench, one outside the top 30. The difference was 13.7 percentage points and a handful of middleware decisions: a verification checklist, a context mapper, loop detection, and a reasoning budget schedule.
+
+The harness is not solved. It’s not commodity. It’s not an afterthought. Managing context as a scarce resource, building verification loops that actually catch failures, persisting memory across sessions without hallucinating history, deciding how much intelligence to delegate to the model versus encode in explicit logic: these are hard engineering problems and they all live in the harness.
+
+The formula stays: Agent = Model + Harness. What's changing is the ratio. The harness does less heavy lifting over time as models improve. But it never goes to zero. Even the most capable model needs something to manage its context, execute its tools, persist its state, and verify its work.
+
+Harness engineering is the actual job. The builders who understand that are the ones shipping agents that work.
+Let’s Keep Learning Together
+
+Did working through all 11 components change how you think about what it actually takes to ship an agent? I’d love to hear which component was the most surprising or which one you’re tackling first.

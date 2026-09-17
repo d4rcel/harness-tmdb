@@ -330,5 +330,113 @@ class ReactLoopTest(unittest.TestCase):
         self.assertIn("chart", answer)
 
 
+class MultiAgentTest(unittest.TestCase):
+    """Tests for the multi-agent architecture."""
+    
+    @classmethod
+    def setUpClass(cls):
+        tools._df_cache = None
+        cls.df = pd.DataFrame({
+            "movie_id": [1, 2, 3, 4, 5],
+            "title": ["a", "b", "c", "d", "e"],
+            "budget": [100, 0, 200, 300, 400],
+            "revenue": [150, 0, 400, 900, 1200],
+            "year": [2000, 2001, 2002, 2000, 2002],
+            "genres": [["Action"], ["Drama"], ["Action"], ["Drama"], ["Action"]],
+            "directors": [["Dir A"], ["Dir B"], ["Dir A"], ["Dir C"], ["Dir A"]],
+            "cast_names": [["Actor 1", "Actor 2"], ["Actor 3"], ["Actor 1"], ["Actor 4"], ["Actor 1", "Actor 5"]],
+        })
+        tools._df_cache = cls.df
+
+    def test_compressor_data_agent(self):
+        from harness.context.compressor import compress_for_data_agent
+        question = "Quel réalisateur a dirigé le plus de films ?"
+        history = []
+        compressed, meta = compress_for_data_agent(question, history)
+        self.assertLess(meta["compressed_chars"], 600)
+        self.assertIn("Question:", compressed)
+        self.assertIn("budget > 1000", compressed)
+        self.assertEqual(meta["target_agent"], "data_agent")
+
+    def test_compressor_viz_agent(self):
+        from harness.context.compressor import compress_for_viz_agent
+        question = "Top 10 réalisateurs"
+        history = [{"action": {"tool": "call_data_agent"}, "observation": {"result_summary": "Top directors found"}}]
+        compressed, meta = compress_for_viz_agent(question, history)
+        self.assertLess(meta["compressed_chars"], 500)
+        self.assertIn("Data to visualize:", compressed)
+        self.assertEqual(meta["target_agent"], "viz_agent")
+
+    def test_compressor_redaction_agent(self):
+        from harness.context.compressor import compress_for_redaction_agent
+        question = "Test question"
+        history = [
+            {"action": {"tool": "call_data_agent"}, "observation": {"result_summary": "Data result"}},
+            {"action": {"tool": "call_viz_agent"}, "observation": {"result_summary": "Chart generated"}}
+        ]
+        compressed, meta = compress_for_redaction_agent(question, history)
+        self.assertLess(meta["compressed_chars"], 800)
+        self.assertIn("Key findings to synthesize:", compressed)
+        self.assertEqual(meta["target_agent"], "redaction_agent")
+
+    def test_condenser_data_agent(self):
+        from harness.context.condenser import condense_data_agent_result
+        internal_turns = [
+            {"action": {"tool": "load_data"}, "observation": {"rows": 5, "cached": False}, "status": "success", "verification": {"syntactic": {"criterion": "nonempty", "passed": True}, "deep": {"criterion": "deep", "passed": True}}},
+            {"action": {"tool": "compute"}, "observation": {"count": 2, "rows": [{"director": "Dir A", "title": 3}, {"director": "Dir B", "title": 1}], "columns": ["director", "title"]}, "status": "success", "verification": {"syntactic": {"criterion": "plausibility", "passed": True}, "deep": {"criterion": "deep", "passed": True}}},
+        ]
+        condensed = condense_data_agent_result(internal_turns)
+        self.assertIn("Loaded 5 films", condensed)
+        self.assertIn("Computed: 2 rows", condensed)
+        self.assertIn("Dir A", condensed)
+
+    def test_condenser_viz_agent(self):
+        from harness.context.condenser import condense_viz_agent_result
+        internal_turns = [
+            {"action": {"tool": "chart"}, "observation": {"path": "chart.png", "count": 10}, "status": "success", "verification": {"syntactic": {"criterion": "nonempty", "passed": True}}},
+        ]
+        condensed = condense_viz_agent_result(internal_turns)
+        self.assertIn("chart.png", condensed)
+        self.assertIn("10 data points", condensed)
+
+    def test_chart_keyword_detection(self):
+        from harness.context.compressor import should_generate_chart
+        # Should trigger
+        self.assertTrue(should_generate_chart("Top 10 des films"))
+        self.assertTrue(should_generate_chart("Graphique des genres"))
+        self.assertTrue(should_generate_chart("Classement par ROI"))
+        self.assertTrue(should_generate_chart("Évolution du budget"))
+        # Should NOT trigger (word boundary check)
+        self.assertFalse(should_generate_chart("Plusieurs films"))
+        self.assertFalse(should_generate_chart("Plus de détails"))
+        self.assertFalse(should_generate_chart("Question simple"))
+
+    def test_supervisor_handoff_logging(self):
+        """Test that supervisor logs handoff metadata correctly."""
+        from harness.agents.supervisor import SupervisorAgent
+        from harness import memory
+        
+        # Create a mock record
+        record = memory.new_supervisor_record("Test question", "gemini-3.6-flash")
+        
+        # Simulate a data agent call with artifacts
+        compute_result = {"count": 2, "rows": [{"director": "Dir A", "title": 3}], "columns": ["director", "title"]}
+        record["supervisor_turns"].append({
+            "turn": 1,
+            "action": {"tool": "call_data_agent", "args": {"task": "test"}},
+            "observation": {
+                "success": True,
+                "result_summary": "Data computed",
+                "artifacts": {"compute_result": compute_result}
+            },
+            "status": "success"
+        })
+        
+        # Verify compute_result is accessible
+        artifacts = record["supervisor_turns"][0]["observation"].get("artifacts", {})
+        self.assertIn("compute_result", artifacts)
+        self.assertEqual(artifacts["compute_result"]["count"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

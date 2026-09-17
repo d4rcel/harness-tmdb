@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import sys
 
-from . import config, llm, memory, react_loop
+from . import config, memory
+from .agents.supervisor import SupervisorAgent
 from .config import ensure_dirs
 
 
@@ -21,9 +22,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     ensure_dirs()
-    print(f"[react] primary model={config.GEMINI_MODEL}")
+    print(f"[supervisor] primary model={config.GEMINI_MODEL}")
 
-    log_path = react_loop.run_react_loop(question)
+    supervisor = SupervisorAgent()
+    log_path = supervisor.run(question)
     print(f"\n[harness] run logged to {log_path}")
 
     # Reload the record to show results
@@ -32,11 +34,24 @@ def main(argv: list[str] | None = None) -> int:
         record = json_mod.load(f)
 
     print(f"[harness] status: {record['status']}")
-    print("\n--- per-turn outcome ---")
-    for turn in record["turns"]:
-        v_syn = turn["verification"]["syntactic"]
-        v_deep = turn["verification"]["deep"]
-        print(f"  turn {turn['turn']}: {turn['action']['tool']} -> {turn['status']} (syn={v_syn['criterion']}={v_syn['passed']}, deep={v_deep.get('criterion', '?')}={v_deep.get('passed', '?')})")
+    print("\n--- supervisor turns ---")
+    for turn in record["supervisor_turns"]:
+        ho = turn.get("handoff", {})
+        handoff_str = ""
+        if ho:
+            handoff_str = f" | handoff: agent={ho.get('agent')} sent={ho.get('context_chars_sent')} chars recv={ho.get('result_chars_received')} chars ratio={ho.get('compression_ratio', 0):.1%}"
+        print(f"  turn {turn['turn']}: {turn['action']['tool']} -> {turn['status']}{handoff_str}")
+
+    if record.get("subagent_logs"):
+        print("\n--- subagent internal turns ---")
+        for agent_name, log in record["subagent_logs"].items():
+            print(f"  {agent_name} ({log.get('verification_status', '?')}): {len(log.get('internal_turns', []))} turns")
+            for t in log.get("internal_turns", []):
+                v_syn = t["verification"]["syntactic"]
+                v_deep = t["verification"]["deep"]
+                deep_str = f", deep={v_deep.get('criterion', '?')}={v_deep.get('passed', '?')}" if v_deep.get('criterion') != 'deep' else ""
+                print(f"    turn {t['turn']}: {t['action']['tool']} -> {t['status']} (syn={v_syn['criterion']}={v_syn['passed']}{deep_str})")
+
     if record["final"]:
         print("\n--- final ---")
         final = dict(record["final"])

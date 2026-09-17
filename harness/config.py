@@ -58,8 +58,16 @@ ROI_MAX_PLAUSIBLE = 10000.0  # 1,000,000% - allows high ROI but catches micro-bu
 RECALCULATION_SAMPLE = 3
 RECALCULATION_TOLERANCE = 0.01  # 1% relative tolerance
 
-# ReAct policy.
+# ReAct policy (v3 single-agent).
 MAX_REACT_TURNS = 5
+
+# Multi-Agent policy (v4).
+SUPERVISOR_MAX_TURNS = 10
+SUBAGENT_MAX_TURNS = {
+    "data_agent": 5,
+    "viz_agent": 2,
+    "redaction_agent": 2,
+}
 
 # Dataset metadata (verified from the raw files).
 PAIR_COUNT = 4803
